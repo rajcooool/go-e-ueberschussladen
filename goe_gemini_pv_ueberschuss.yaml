@@ -2,12 +2,21 @@
 # go-e Gemini – PV-Überschussladen über Home Assistant
 # ohne ha-goecharger-api2 Integration, nur lokale HTTP API v2
 #
-# Wallbox-IP: 192.168.178.56  (bei Bedarf global ersetzen)
+# Einbinden als Package (configuration.yaml):
+#   homeassistant:
+#     packages:
+#       goe: !include goe_gemini_pv_ueberschuss.yaml
+#
+# Benötigt Home Assistant 2024.10 oder neuer
+# (Syntax triggers/conditions/actions).
+#
+# Wallbox-IP: 192.168.178.56  -> kommt genau 2x vor
+#             (rest_command.goe_set und rest-Sensor)
 # Netzsensor: sensor.inverter_grid_power
 #             negativ = Einspeisung, positiv = Bezug
 #
-# Einmalig an der Wallbox setzen (oder per Automation unten):
-#   http://192.168.178.56/api/set?lmo=3&fup=false
+# Alle Schaltschwellen stehen gesammelt am Anfang der
+# Hauptregelung (Abschnitt 6.1).
 # =====================================================
 
 # =====================================================
@@ -27,6 +36,8 @@ input_number:
     unit_of_measurement: A
     icon: mdi:current-ac
 
+  # Wird vom Überschuss abgezogen und bleibt als Einspeisung übrig.
+  # Wert in der Oberfläche einstellen (Einstellungen -> Helfer).
   wallbox_reserve:
     name: Wallbox Reserve (Puffer)
     min: 0
@@ -43,42 +54,27 @@ timer:
     restore: true
 
 # =====================================================
-# 2. REST-Befehle (Schreiben)
+# 2. REST-Befehl (Schreiben)
+#    Ein einziger Befehl für alle Parameter, z. B.
+#      query: "amp=10"   Ladestrom in A
+#      query: "psm=2"    1 = einphasig, 2 = dreiphasig
+#      query: "frc=1"    0 = neutral, 1 = gesperrt, 2 = erzwungen
 # =====================================================
 rest_command:
-  goe_set_amp:
-    url: "http://192.168.178.56/api/set?amp={{ amps | int }}"
-    method: GET
-    timeout: 10
-
-  goe_set_psm:
-    url: "http://192.168.178.56/api/set?psm={{ phase | int }}"
-    method: GET
-    timeout: 10
-
-  # frc: 0 = neutral, 1 = Laden gesperrt, 2 = Laden erzwungen
-  goe_set_frc:
-    url: "http://192.168.178.56/api/set?frc={{ state | int }}"
-    method: GET
-    timeout: 10
-
-  # Interne ECO-/PV-Logik der Wallbox abschalten
-  goe_set_mode:
-    url: "http://192.168.178.56/api/set?lmo=3&fup=false"
+  goe_set:
+    url: "http://192.168.178.56/api/set?{{ query }}"
     method: GET
     timeout: 10
 
 # =====================================================
 # 3. REST-Sensoren (Lesen)
-#    Ohne diese Werte ist keine stabile Regelung möglich!
 # =====================================================
 rest:
   - resource: "http://192.168.178.56/api/status?filter=nrg,psm,amp,frc,car"
     scan_interval: 10
     timeout: 5
     sensor:
-      # Aktuelle Ladeleistung der Wallbox
-      # ACHTUNG: Index prüfen! Bei API v2 ist nrg[11] die Gesamtleistung in W.
+      # nrg[11] = Gesamtleistung in W (API v2)
       - name: "goe Ladeleistung"
         unique_id: goe_ladeleistung
         value_template: "{{ value_json.nrg[11] | float(0) | round(0) }}"
@@ -96,20 +92,20 @@ rest:
         value_template: "{{ value_json.amp | int(0) }}"
         unit_of_measurement: A
 
+      # 0 = neutral, 1 = gesperrt, 2 = erzwungen
       - name: "goe Force State"
         unique_id: goe_force_state
         value_template: "{{ value_json.frc | int(0) }}"
 
-      # 1 = bereit/kein Auto, 2 = lädt, 3 = wartet auf Auto, 4 = beendet, 5 = Fehler
+      # 1 = kein Auto, 2 = lädt, 3 = wartet auf Auto, 4 = beendet, 5 = Fehler
       - name: "goe Fahrzeugstatus"
         unique_id: goe_fahrzeugstatus
         value_template: "{{ value_json.car | int(0) }}"
 
 # =====================================================
 # 4. Berechneter Überschuss
-#    KERNKORREKTUR: die bereits fließende Ladeleistung
-#    muss wieder hinzugerechnet werden, sonst regelt
-#    sich die Automation selbst tot.
+#    Die bereits fließende Ladeleistung wird wieder
+#    hinzugerechnet, sonst regelt sich die Automation tot.
 # =====================================================
 template:
   - sensor:
@@ -122,12 +118,12 @@ template:
           {{ states('sensor.inverter_grid_power') | is_number
              and states('sensor.goe_ladeleistung') | is_number }}
         state: >
-          {% set grid    = states('sensor.inverter_grid_power') | float(0) %}
-          {% set laden   = states('sensor.goe_ladeleistung')    | float(0) %}
+          {% set grid    = states('sensor.inverter_grid_power')   | float(0) %}
+          {% set laden   = states('sensor.goe_ladeleistung')      | float(0) %}
           {% set reserve = states('input_number.wallbox_reserve') | float(100) %}
-          {{ (-grid + laden - reserve) | round(0) }}
+          {{ (laden - grid - reserve) | round(0) }}
 
-# Glättung – verhindert Reaktion auf jede vorbeiziehende Wolke
+# Glättung über 2 Minuten – keine Reaktion auf jede Wolke
 sensor:
   - platform: statistics
     name: "PV Ueberschuss geglaettet"
@@ -140,6 +136,8 @@ sensor:
 
 # =====================================================
 # 5. Script: sicherer Phasenwechsel
+#    Laden stoppen -> Phasen umschalten -> Strom setzen
+#    -> Laden starten -> Sperrzeit starten
 # =====================================================
 script:
   goe_phasenwechsel:
@@ -153,23 +151,22 @@ script:
         description: "Ladestrom in A nach dem Wechsel"
         example: 10
     sequence:
-      - service: rest_command.goe_set_frc
+      - action: rest_command.goe_set
         data:
-          state: 1
+          query: "frc=1"
       - delay: "00:00:05"
-      - service: rest_command.goe_set_psm
+      - action: rest_command.goe_set
         data:
-          phase: "{{ phase }}"
+          query: "psm={{ phase | int }}"
       - delay: "00:00:05"
-      - service: rest_command.goe_set_amp
+      - action: rest_command.goe_set
         data:
-          amps: "{{ amps }}"
+          query: "amp={{ amps | int }}"
       - delay: "00:00:02"
-      - service: rest_command.goe_set_frc
+      - action: rest_command.goe_set
         data:
-          state: 2
-      # Sperrzeit starten, damit nicht sofort zurückgeschaltet wird
-      - service: timer.start
+          query: "frc=2"
+      - action: timer.start
         target:
           entity_id: timer.wallbox_phasensperre
 
@@ -178,109 +175,104 @@ script:
 # =====================================================
 automation:
   # ---------------------------------------------------
-  # 6.1 Hauptregelung
+  # 6.1 Hauptregelung (alle 30 s)
   # ---------------------------------------------------
   - id: goe_pv_regelung
     alias: go-e PV-Regelung
     description: PV-Überschussladen, vollständig durch Home Assistant gesteuert
     mode: single
     max_exceeded: silent
-    trigger:
-      - platform: time_pattern
+    triggers:
+      - trigger: time_pattern
         seconds: "/30"
-    condition:
+    conditions:
       - condition: state
         entity_id: input_boolean.wallbox_pv_steuerung
         state: "on"
       - condition: template
-        value_template: "{{ states('sensor.pv_ueberschuss_geglaettet') | is_number }}"
+        value_template: >
+          {{ states('sensor.pv_ueberschuss_geglaettet') | is_number
+             and states('sensor.goe_phasenmodus') | is_number }}
+      # 1 = kein Auto angeschlossen -> nichts zu tun
       - condition: template
-        value_template: "{{ states('sensor.goe_phasenmodus') | is_number }}"
-    action:
+        value_template: "{{ states('sensor.goe_fahrzeugstatus') | int(1) != 1 }}"
+    actions:
       - variables:
+          # --- Schaltschwellen (W, nach Abzug der Reserve) ---
+          aus_unter: 1300          # Laden stoppen
+          ein_ab: 1400             # Laden wieder starten
+          dreiphasig_ab: 4400      # Wechsel 1ph -> 3ph
+          einphasig_unter: 4000    # Wechsel 3ph -> 1ph
+
+          # --- Istwerte ---
           verfuegbar: "{{ states('sensor.pv_ueberschuss_geglaettet') | float(0) }}"
+          laden: "{{ states('sensor.goe_ladeleistung') | float(0) }}"
           max_amp: "{{ states('input_number.wallbox_max_ampere') | int(16) }}"
           psm_ist: "{{ states('sensor.goe_phasenmodus') | int(1) }}"
           amp_ist: "{{ states('sensor.goe_ladestrom_soll') | int(0) }}"
           frc_ist: "{{ states('sensor.goe_force_state') | int(0) }}"
-          car: "{{ states('sensor.goe_fahrzeugstatus') | int(1) }}"
           gesperrt: "{{ is_state('timer.wallbox_phasensperre', 'active') }}"
 
-      # Hysterese: hoch bei 4400 W, zurück erst unter 4000 W
-      - variables:
-          wunsch_psm: >
-            {% if psm_ist == 2 %}
-              {{ 2 if verfuegbar >= 4000 else 1 }}
+          # --- Phasenwahl mit Hysterese, während der Sperrzeit unverändert ---
+          ziel_psm: >
+            {% if gesperrt %}
+              {{ psm_ist }}
+            {% elif psm_ist == 2 %}
+              {{ 2 if verfuegbar >= einphasig_unter else 1 }}
             {% else %}
-              {{ 2 if verfuegbar >= 4400 else 1 }}
+              {{ 2 if verfuegbar >= dreiphasig_ab else 1 }}
             {% endif %}
 
-      # Während der Sperrzeit bleibt der aktuelle Modus bestehen
-      - variables:
-          ziel_psm: "{{ psm_ist if gesperrt else wunsch_psm | int(1) }}"
+          # --- Watt pro Ampere ---
+          # Während der Ladung aus der Messung (Netzspannung, Auto
+          # nimmt evtl. etwas weniger als freigegeben), sonst 230 V.
+          # Begrenzt auf 180–240 W pro Phase gegen Ausreißer.
+          w_pro_a: >
+            {% set ph = 1 if ziel_psm | int == 1 else 3 %}
+            {% if amp_ist >= 6 and laden > 500 and ziel_psm | int == psm_ist %}
+              {% set w = laden / amp_ist %}
+            {% else %}
+              {% set w = 230 * ph %}
+            {% endif %}
+            {{ [[w, 180 * ph] | max, 240 * ph] | min }}
 
-      - variables:
-          phasen: "{{ 1 if ziel_psm | int == 1 else 3 }}"
           ziel_amp: >
-            {{ [[ (verfuegbar / (230 * (1 if ziel_psm | int == 1 else 3))) | int(0), 6 ]
-                | max, max_amp ] | min }}
+            {{ [[ (verfuegbar / w_pro_a) | int(0), 6 ] | max, max_amp ] | min }}
 
       - choose:
-          # --- Kein Fahrzeug angeschlossen oder Ladung beendet ---
-          - conditions:
-              - condition: template
-                value_template: "{{ car == 1 }}"
+          # --- Zu wenig Überschuss: Laden stoppen ---
+          - conditions: "{{ verfuegbar < aus_unter }}"
+            sequence:
+              - if: "{{ frc_ist != 1 }}"
+                then:
+                  - action: rest_command.goe_set
+                    data:
+                      query: "frc=1"
+
+          # --- Gesperrt und noch unter der Einschaltschwelle: warten ---
+          - conditions: "{{ frc_ist == 1 and verfuegbar < ein_ab }}"
             sequence: []
 
-          # --- Zu wenig Überschuss: abschalten (Hysterese 1300 W) ---
-          - conditions:
-              - condition: template
-                value_template: "{{ verfuegbar < 1300 }}"
+          # --- Phasenwechsel nötig ---
+          - conditions: "{{ ziel_psm | int != psm_ist }}"
             sequence:
-              - if:
-                  - condition: template
-                    value_template: "{{ frc_ist != 1 }}"
-                then:
-                  - service: rest_command.goe_set_frc
-                    data:
-                      state: 1
+              - action: script.goe_phasenwechsel
+                data:
+                  phase: "{{ ziel_psm | int }}"
+                  amps: "{{ ziel_amp | int }}"
 
-        # --- Normalbetrieb ---
+        # --- Normalbetrieb: nur nachregeln, was sich geändert hat ---
         default:
-          # Wiedereinschalten erst ab 1400 W
-          - if:
-              - condition: template
-                value_template: "{{ verfuegbar < 1400 and frc_ist == 1 }}"
+          - if: "{{ ziel_amp | int != amp_ist }}"
             then:
-              - stop: "Warte auf ausreichenden Ueberschuss (Einschalthysterese)"
-
-          - choose:
-              # Phasenwechsel nötig -> Script (Stopp, Umschalten, Start)
-              - conditions:
-                  - condition: template
-                    value_template: "{{ ziel_psm | int != psm_ist }}"
-                sequence:
-                  - service: script.goe_phasenwechsel
-                    data:
-                      phase: "{{ ziel_psm | int }}"
-                      amps: "{{ ziel_amp | int }}"
-
-            # Kein Phasenwechsel -> nur nachregeln, was sich geaendert hat
-            default:
-              - if:
-                  - condition: template
-                    value_template: "{{ ziel_amp | int != amp_ist }}"
-                then:
-                  - service: rest_command.goe_set_amp
-                    data:
-                      amps: "{{ ziel_amp | int }}"
-              - if:
-                  - condition: template
-                    value_template: "{{ frc_ist != 2 }}"
-                then:
-                  - service: rest_command.goe_set_frc
-                    data:
-                      state: 2
+              - action: rest_command.goe_set
+                data:
+                  query: "amp={{ ziel_amp | int }}"
+          - if: "{{ frc_ist != 2 }}"
+            then:
+              - action: rest_command.goe_set
+                data:
+                  query: "frc=2"
 
   # ---------------------------------------------------
   # 6.2 Steuerung ausgeschaltet -> Wallbox freigeben
@@ -288,34 +280,37 @@ automation:
   - id: goe_pv_steuerung_aus
     alias: go-e PV-Steuerung ausgeschaltet
     mode: single
-    trigger:
-      - platform: state
+    triggers:
+      - trigger: state
         entity_id: input_boolean.wallbox_pv_steuerung
         to: "off"
-    action:
-      - service: rest_command.goe_set_amp
+    actions:
+      - action: rest_command.goe_set
         data:
-          amps: "{{ states('input_number.wallbox_max_ampere') | int(16) }}"
+          query: "amp={{ states('input_number.wallbox_max_ampere') | int(16) }}"
       # frc 0 = neutral: Wallbox entscheidet wieder selbst
-      - service: rest_command.goe_set_frc
+      - action: rest_command.goe_set
         data:
-          state: 0
+          query: "frc=0"
 
   # ---------------------------------------------------
-  # 6.3 Beim HA-Start: interne Wallbox-Logik deaktivieren
+  # 6.3 Beim HA-Start: interne ECO-/PV-Logik der Wallbox
+  #     abschalten (Basic-Modus, kein eigenes PV-Laden)
   # ---------------------------------------------------
   - id: goe_modus_setzen
     alias: go-e Basic-Modus erzwingen
     mode: single
-    trigger:
-      - platform: homeassistant
+    triggers:
+      - trigger: homeassistant
         event: start
-    action:
+    actions:
       - delay: "00:00:30"
-      - service: rest_command.goe_set_mode
+      - action: rest_command.goe_set
+        data:
+          query: "lmo=3&fup=false"
 
 # =====================================================
-# Schaltschwellen im Überblick
+# Schaltschwellen im Überblick (Überschuss nach Reserve)
 # -----------------------------------------------------
 #   < 1300 W          -> Laden stoppen
 #   1300 – 1400 W     -> Totband (kein Wiedereinschalten)
@@ -323,4 +318,7 @@ automation:
 #   >= 4400 W         -> Wechsel auf dreiphasig
 #   < 4000 W (in 3ph) -> zurück auf einphasig
 #   Nach jedem Phasenwechsel: 5 Minuten Sperrzeit
+#
+# Tatsächliche Einspeisung = Schwelle + Reserve
+# (z. B. Start bei 1400 W + 50 W Reserve = 1450 W)
 # =====================================================
