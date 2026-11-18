@@ -12,20 +12,42 @@
 #
 # Wallbox-IP: 192.168.178.56  -> kommt genau 2x vor
 #             (rest_command.goe_set und rest-Sensor)
-# Netzsensor: sensor.inverter_grid_power
-#             negativ = Einspeisung, positiv = Bezug
+# Sensoren:   sensor.inverter_grid_power
+#               negativ = Einspeisung, positiv = Bezug
+#             sensor.inverter_battery          SoC des Speichers in %
+#             sensor.inverter_battery_power
+#               positiv = Speicher lädt, negativ = entlädt
 #
-# Alle Schaltschwellen stehen gesammelt am Anfang der
+# Modi (input_select.wallbox_modus):
+#   Aus      -> Wallbox freigegeben, lädt normal mit Max Ampere
+#   Speicher -> 7 A dreiphasig aus dem Speicher,
+#               Stopp bei 30 % SoC, Neustart ab 50 %
+#   PV       -> Überschussladen, Speicher hat Vorrang.
+#               Ab 80 % SoC feste Leistung 6 A dreiphasig,
+#               Speicher gleicht bis 2 kW aus (siehe 6.1)
+#
+# Alle Grenzen stehen gesammelt am Anfang der
 # Hauptregelung (Abschnitt 6.1).
 # =====================================================
 
 # =====================================================
 # 1. Helfer
 # =====================================================
+input_select:
+  wallbox_modus:
+    name: Wallbox Modus
+    options:
+      - Aus
+      - Speicher
+      - PV
+    icon: mdi:ev-station
+
 input_boolean:
-  wallbox_pv_steuerung:
-    name: Wallbox PV Steuerung
-    icon: mdi:solar-power
+  # Wird von der Regelung gesetzt, nur zur Anzeige:
+  # an = PV-Modus lädt gerade mit fester Leistung
+  wallbox_festleistung:
+    name: Wallbox Festleistung aktiv
+    icon: mdi:battery-arrow-down
 
 input_number:
   wallbox_max_ampere:
@@ -109,6 +131,11 @@ rest:
 # =====================================================
 template:
   - sensor:
+      # Überschuss für das gleitende Laden, Speicher hat Vorrang:
+      # - Speicher lädt  -> zählt NICHT als Überschuss
+      # - Speicher entlädt (deckt das Auto) -> wird abgezogen,
+      #   sonst hält der Wechselrichter das Netz auf 0 W und die
+      #   Regelung hielte Speicherstrom für PV-Überschuss.
       - name: "PV Ueberschuss"
         unique_id: pv_ueberschuss_roh
         unit_of_measurement: W
@@ -118,13 +145,33 @@ template:
           {{ states('sensor.inverter_grid_power') | is_number
              and states('sensor.goe_ladeleistung') | is_number }}
         state: >
-          {% set grid    = states('sensor.inverter_grid_power')   | float(0) %}
-          {% set laden   = states('sensor.goe_ladeleistung')      | float(0) %}
-          {% set reserve = states('input_number.wallbox_reserve') | float(100) %}
-          {{ (laden - grid - reserve) | round(0) }}
+          {% set grid    = states('sensor.inverter_grid_power')    | float(0) %}
+          {% set laden   = states('sensor.goe_ladeleistung')       | float(0) %}
+          {% set batt    = states('sensor.inverter_battery_power') | float(0) %}
+          {% set reserve = states('input_number.wallbox_reserve')  | float(100) %}
+          {{ (laden - grid + [batt, 0] | min - reserve) | round(0) }}
 
-# Glättung über 2 Minuten – keine Reaktion auf jede Wolke
+      # Gesamter PV-Überschuss inkl. Speicher-Ladeleistung
+      # (= PV minus Hausverbrauch). Entscheidet, ob genug PV
+      # für die feste Leistung ab 80 % SoC da ist.
+      - name: "PV Ueberschuss gesamt"
+        unique_id: pv_ueberschuss_gesamt
+        unit_of_measurement: W
+        device_class: power
+        state_class: measurement
+        availability: >
+          {{ states('sensor.inverter_grid_power') | is_number
+             and states('sensor.goe_ladeleistung') | is_number
+             and states('sensor.inverter_battery_power') | is_number }}
+        state: >
+          {% set grid    = states('sensor.inverter_grid_power')    | float(0) %}
+          {% set laden   = states('sensor.goe_ladeleistung')       | float(0) %}
+          {% set batt    = states('sensor.inverter_battery_power') | float(0) %}
+          {% set reserve = states('input_number.wallbox_reserve')  | float(100) %}
+          {{ (laden - grid + batt - reserve) | round(0) }}
+
 sensor:
+  # Glättung über 2 Minuten – keine Reaktion auf jede Wolke
   - platform: statistics
     name: "PV Ueberschuss geglaettet"
     unique_id: pv_ueberschuss_geglaettet
@@ -133,6 +180,25 @@ sensor:
     sampling_size: 60
     max_age:
       minutes: 2
+
+  # 5-Minuten-Mittel für die Umschaltung feste Leistung <-> gleitend
+  - platform: statistics
+    name: "PV Ueberschuss gesamt 5min"
+    unique_id: pv_ueberschuss_gesamt_5min
+    entity_id: sensor.pv_ueberschuss_gesamt
+    state_characteristic: mean
+    sampling_size: 300
+    max_age:
+      minutes: 5
+
+  - platform: statistics
+    name: "Speicher Leistung 5min"
+    unique_id: speicher_leistung_5min
+    entity_id: sensor.inverter_battery_power
+    state_characteristic: mean
+    sampling_size: 300
+    max_age:
+      minutes: 5
 
 # =====================================================
 # 5. Script: sicherer Phasenwechsel
@@ -175,20 +241,27 @@ script:
 # =====================================================
 automation:
   # ---------------------------------------------------
-  # 6.1 Hauptregelung (alle 30 s)
+  # 6.1 Hauptregelung (alle 30 s und bei Moduswechsel)
   # ---------------------------------------------------
   - id: goe_pv_regelung
     alias: go-e PV-Regelung
-    description: PV-Überschussladen, vollständig durch Home Assistant gesteuert
+    description: Speicher- und PV-Laden, vollständig durch Home Assistant gesteuert
     mode: single
     max_exceeded: silent
     triggers:
       - trigger: time_pattern
         seconds: "/30"
+        id: takt
+      - trigger: state
+        entity_id: input_select.wallbox_modus
+        to:
+          - Speicher
+          - PV
+        id: modus
     conditions:
-      - condition: state
-        entity_id: input_boolean.wallbox_pv_steuerung
-        state: "on"
+      - condition: template
+        value_template: >
+          {{ states('input_select.wallbox_modus') in ['Speicher', 'PV'] }}
       - condition: template
         value_template: >
           {{ states('sensor.pv_ueberschuss_geglaettet') | is_number
@@ -198,13 +271,29 @@ automation:
         value_template: "{{ states('sensor.goe_fahrzeugstatus') | int(1) != 1 }}"
     actions:
       - variables:
-          # --- Schaltschwellen (W, nach Abzug der Reserve) ---
-          aus_unter: 1300          # Laden stoppen
-          ein_ab: 1400             # Laden wieder starten
-          dreiphasig_ab: 4400      # Wechsel 1ph -> 3ph
-          einphasig_unter: 4000    # Wechsel 3ph -> 1ph
+          # --- Grenzen: gleitendes Überschussladen (W, nach Reserve) ---
+          aus_unter: 1300            # Laden stoppen
+          ein_ab: 1400               # Laden wieder starten
+          dreiphasig_ab: 4400        # Wechsel 1ph -> 3ph
+          einphasig_unter: 4000      # Wechsel 3ph -> 1ph
+
+          # --- Grenzen: Speicher-Modus ---
+          speicher_amp: 7            # 7 A dreiphasig ≈ 4,8 kW
+          speicher_stopp_soc: 30     # Stopp bei <= 30 %
+          speicher_start_soc: 50     # Neustart ab 50 %
+
+          # --- Grenzen: PV-Modus mit fester Leistung ---
+          fest_amp: 6                # 6 A dreiphasig ≈ 4,1 kW
+          fest_ab_soc: 80            # feste Leistung ab 80 %
+          fest_aus_unter_soc: 50     # zurück auf gleitend unter 50 %
+          fest_max_speicher: 2000    # Speicher gibt im 5-min-Mittel max. 2 kW ab
+          fest_zurueck_ab: 2500      # wieder fest ab 2,5 kW Überschuss (5-min-Mittel)
 
           # --- Istwerte ---
+          modus: "{{ states('input_select.wallbox_modus') }}"
+          soc: "{{ states('sensor.inverter_battery') | float(0) }}"
+          speicher_5min: "{{ states('sensor.speicher_leistung_5min') | float(0) }}"
+          pv_gesamt_5min: "{{ states('sensor.pv_ueberschuss_gesamt_5min') | float(0) }}"
           verfuegbar: "{{ states('sensor.pv_ueberschuss_geglaettet') | float(0) }}"
           laden: "{{ states('sensor.goe_ladeleistung') | float(0) }}"
           max_amp: "{{ states('input_number.wallbox_max_ampere') | int(16) }}"
@@ -212,10 +301,43 @@ automation:
           amp_ist: "{{ states('sensor.goe_ladestrom_soll') | int(0) }}"
           frc_ist: "{{ states('sensor.goe_force_state') | int(0) }}"
           gesperrt: "{{ is_state('timer.wallbox_phasensperre', 'active') }}"
+          fest_ist: "{{ is_state('input_boolean.wallbox_festleistung', 'on') }}"
 
-          # --- Phasenwahl mit Hysterese, während der Sperrzeit unverändert ---
+          # --- Speicher-Modus: Freigabe mit Hysterese 30 % / 50 % ---
+          # Beim Wählen des Modus reicht > 30 %, danach entscheidet,
+          # ob die Wallbox gerade lädt (frc 2) oder gestoppt ist (frc 1).
+          speicher_frei: >
+            {% if trigger.id == 'modus' or frc_ist != 1 %}
+              {{ soc > speicher_stopp_soc }}
+            {% else %}
+              {{ soc >= speicher_start_soc }}
+            {% endif %}
+
+          # --- PV-Modus: feste Leistung an/aus ---
+          # an:  SoC >= 80 % und 5 min im Mittel >= 2,5 kW Überschuss
+          # aus: SoC < 50 % oder Speicher gibt 5 min im Mittel > 2 kW ab
+          fest_pv: >
+            {% if modus != 'PV' %}
+              false
+            {% elif fest_ist %}
+              {{ soc >= fest_aus_unter_soc and speicher_5min >= -fest_max_speicher }}
+            {% else %}
+              {{ soc >= fest_ab_soc and pv_gesamt_5min >= fest_zurueck_ab }}
+            {% endif %}
+
+          # --- Was ist zu tun? ---
+          fest: "{{ (modus == 'Speicher' and speicher_frei) or fest_pv }}"
+          stopp: >
+            {{ (modus == 'Speicher' and not speicher_frei)
+               or (modus == 'PV' and not fest and verfuegbar < aus_unter) }}
+          warten: >
+            {{ modus == 'PV' and not fest and frc_ist == 1 and verfuegbar < ein_ab }}
+
+          # --- Phasen: fest immer dreiphasig, sonst Hysterese + Sperrzeit ---
           ziel_psm: >
-            {% if gesperrt %}
+            {% if fest %}
+              2
+            {% elif gesperrt %}
               {{ psm_ist }}
             {% elif psm_ist == 2 %}
               {{ 2 if verfuegbar >= einphasig_unter else 1 }}
@@ -237,11 +359,27 @@ automation:
             {{ [[w, 180 * ph] | max, 240 * ph] | min }}
 
           ziel_amp: >
-            {{ [[ (verfuegbar / w_pro_a) | int(0), 6 ] | max, max_amp ] | min }}
+            {% if fest %}
+              {{ [speicher_amp if modus == 'Speicher' else fest_amp, max_amp] | min }}
+            {% else %}
+              {{ [[ (verfuegbar / w_pro_a) | int(0), 6 ] | max, max_amp ] | min }}
+            {% endif %}
+
+      # Anzeige-Helfer nachführen
+      - if: "{{ fest_pv and not fest_ist }}"
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.wallbox_festleistung
+      - if: "{{ fest_ist and not fest_pv }}"
+        then:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.wallbox_festleistung
 
       - choose:
-          # --- Zu wenig Überschuss: Laden stoppen ---
-          - conditions: "{{ verfuegbar < aus_unter }}"
+          # --- Laden stoppen ---
+          - conditions: "{{ stopp }}"
             sequence:
               - if: "{{ frc_ist != 1 }}"
                 then:
@@ -249,8 +387,8 @@ automation:
                     data:
                       query: "frc=1"
 
-          # --- Gesperrt und noch unter der Einschaltschwelle: warten ---
-          - conditions: "{{ frc_ist == 1 and verfuegbar < ein_ab }}"
+          # --- Gestoppt und noch unter der Einschaltschwelle: warten ---
+          - conditions: "{{ warten }}"
             sequence: []
 
           # --- Phasenwechsel nötig ---
@@ -261,7 +399,7 @@ automation:
                   phase: "{{ ziel_psm | int }}"
                   amps: "{{ ziel_amp | int }}"
 
-        # --- Normalbetrieb: nur nachregeln, was sich geändert hat ---
+        # --- Laden: nur nachregeln, was sich geändert hat ---
         default:
           - if: "{{ ziel_amp | int != amp_ist }}"
             then:
@@ -275,16 +413,19 @@ automation:
                   query: "frc=2"
 
   # ---------------------------------------------------
-  # 6.2 Steuerung ausgeschaltet -> Wallbox freigeben
+  # 6.2 Modus „Aus“ -> Wallbox freigeben
   # ---------------------------------------------------
   - id: goe_pv_steuerung_aus
-    alias: go-e PV-Steuerung ausgeschaltet
+    alias: go-e Modus Aus
     mode: single
     triggers:
       - trigger: state
-        entity_id: input_boolean.wallbox_pv_steuerung
-        to: "off"
+        entity_id: input_select.wallbox_modus
+        to: Aus
     actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.wallbox_festleistung
       - action: rest_command.goe_set
         data:
           query: "amp={{ states('input_number.wallbox_max_ampere') | int(16) }}"
@@ -310,8 +451,9 @@ automation:
           query: "lmo=3&fup=false"
 
 # =====================================================
-# Schaltschwellen im Überblick (Überschuss nach Reserve)
+# Grenzen im Überblick
 # -----------------------------------------------------
+# PV, gleitend (Überschuss am Netz nach Reserve):
 #   < 1300 W          -> Laden stoppen
 #   1300 – 1400 W     -> Totband (kein Wiedereinschalten)
 #   >= 1400 W         -> einphasig laden (6 – 16 A)
@@ -319,6 +461,12 @@ automation:
 #   < 4000 W (in 3ph) -> zurück auf einphasig
 #   Nach jedem Phasenwechsel: 5 Minuten Sperrzeit
 #
-# Tatsächliche Einspeisung = Schwelle + Reserve
-# (z. B. Start bei 1400 W + 50 W Reserve = 1450 W)
+# PV, feste Leistung 6 A dreiphasig (≈ 4,1 kW):
+#   an:  SoC >= 80 % UND Überschuss inkl. Speicher
+#        5 min im Mittel >= 2500 W
+#   aus: SoC < 50 % ODER Speicher gibt 5 min im Mittel
+#        mehr als 2000 W ab -> zurück auf gleitend
+#
+# Speicher, 7 A dreiphasig (≈ 4,8 kW):
+#   Stopp bei <= 30 % SoC, Neustart ab 50 %
 # =====================================================
